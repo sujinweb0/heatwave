@@ -1,218 +1,150 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import folium
-import json
-import requests
 from streamlit_folium import st_folium
+import requests
+import io
+import copy
 
-# 1. 페이지 설정
-st.set_page_config(
-    page_title="전국 폭염일수 현황 지도",
-    page_icon="🔥",
-    layout="wide"
-)
+st.set_page_config(page_title="전국 폭염일수 대시보드", page_icon="\u2600\ufe0f", layout="wide")
+st.title("\u2600\ufe0f 대한민국 폭염 종합 분석 대시보드")
+st.caption("기상청 관측망 데이터를 바탕으로 한 전국 폭염일수 지도 및 연도별 주요 폭염 기록 통계입니다.")
 
-st.title("🔥 전국 폭염일수 현황 및 분석")
-st.markdown("기상청 폭염 관측 데이터와 행정구역(시군구) 경계를 결합한 시각화 대시보드입니다.")
+GEOJSON_URL = "https://raw.githubusercontent.com/greatsong/modudata/main/data/boundaries/sigungu_kr.geojson"
 
-# -----------------------------------------------------------------------------
-# 2. 데이터 로드 및 세 섹션 분리 함수
-# -----------------------------------------------------------------------------
 @st.cache_data
-def load_heatwave_data(file_path="heatwave.csv"):
-    """
-    하나의 CSV 파일 내 3개 섹션("가장 긴 폭염", "가장 빠른/가장 늦은 폭염", "전국 폭염일수")을
-    구분하여 3개의 데이터프레임으로 반환합니다.
-    """
-    # 2-1. 파일 인코딩 처리 (utf-8 실패 시 cp949 시도)
-    lines = []
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except (UnicodeDecodeError, FileNotFoundError):
-        try:
-            with open(file_path, "r", encoding="cp949") as f:
-                lines = f.readlines()
-        except Exception as e:
-            st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
-            return None, None, None
-
-    # 2-2. 섹션별 줄 번호 찾기
-    sec1_idx, sec2_idx, sec3_idx = -1, -1, -1
-    for i, line in enumerate(lines):
-        if "가장 긴 폭염" in line:
-            sec1_idx = i
-        elif "가장 빠른/가장 늦은 폭염" in line:
-            sec2_idx = i
-        elif "전국 폭염일수" in line:
-            sec3_idx = i
-
-    # 2-3. 각 섹션 파싱 함수
-    def parse_section(start_idx, end_idx):
-        if start_idx == -1:
-            return pd.DataFrame()
-        
-        section_lines = lines[start_idx:end_idx] if end_idx else lines[start_idx:]
-        # 헤더 선언 전 빈 줄이나 제목 줄 제거
-        cleaned_lines = [l.strip() for l in section_lines if l.strip()]
-        
-        if len(cleaned_lines) < 2:
-            return pd.DataFrame()
-
-        # 데이터 변환 (첫 번째 유효한 줄을 헤더로 사용)
-        header = [c.strip() for c in cleaned_lines[1].split(",")]
-        data = []
-        for line in cleaned_lines[2:]:
-            row = [c.strip() for c in line.split(",")]
-            if len(row) == len(header):
-                data.append(row)
-        return pd.DataFrame(data, columns=header)
-
-    # 2-4. 섹션 추출 실행
-    df_longest = parse_section(sec1_idx, sec2_idx if sec2_idx != -1 else len(lines))
-    df_earliest_latest = parse_section(sec2_idx, sec3_idx if sec3_idx != -1 else len(lines))
-    df_raw = parse_section(sec3_idx, None)
-
-    return df_longest, df_earliest_latest, df_raw
-
-
-# GeoJSON 경계 데이터 로드 함수
-@st.cache_data
-def load_geojson():
-    url = "https://raw.githubusercontent.com/greatsong/modudata/main/data/boundaries/sigungu_kr.geojson"
+def load_geojson(url):
     response = requests.get(url)
     return response.json()
 
-# 데이터 로딩
-df_longest, df_earliest_latest, df_raw = load_heatwave_data("heatwave.csv")
-geojson_data = load_geojson()
+@st.cache_data
+def load_all_heatwave_data():
+    """하나의 heatwave.csv에서 3개 섹션의 데이터를 각각 읽어옵니다."""
+    try:
+        with open("heatwave.csv", "r", encoding="cp949") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        with open("heatwave.csv", "r", encoding="utf-8") as f:
+            lines = f.readlines()
 
-if df_raw.empty:
-    st.error("데이터를 불러오지 못했습니다. 'heatwave.csv' 파일이 올바른 위치에 있는지 확인해 주세요.")
+    longest_idx = extreme_idx = points_idx = None
+    for idx, line in enumerate(lines):
+        clean_l = line.strip()
+        if clean_l == "가장 긴 폭염":
+            longest_idx = idx + 1
+        elif clean_l == "가장 빠른/가장 늦은 폭염":
+            extreme_idx = idx + 1
+        elif clean_l == "전국 폭염일수":
+            points_idx = idx + 2
+
+    longest_lines = []
+    for l in lines[longest_idx:]:
+        if not l.strip() or "가장 빠른" in l:
+            break
+        longest_lines.append(l)
+    df_longest = pd.read_csv(io.StringIO("".join(longest_lines)))
+    df_longest.columns = [c.strip() for c in df_longest.columns]
+
+    extreme_lines = []
+    for l in lines[extreme_idx:]:
+        if not l.strip() or "전국 폭염일수" in l:
+            break
+        extreme_lines.append(l)
+    df_extreme = pd.read_csv(io.StringIO("".join(extreme_lines)))
+    df_extreme.columns = [c.strip() for c in df_extreme.columns]
+
+    df_points = pd.read_csv(io.StringIO("".join(lines[points_idx:])))
+    df_points.columns = [c.strip() for c in df_points.columns]
+    df_points = df_points.dropna(subset=["년도", "지점"])
+    df_points["년도"] = df_points["년도"].astype(int)
+
+    return df_longest, df_extreme, df_points
+
+try:
+    geojson_raw = load_geojson(GEOJSON_URL)
+    df_longest, df_extreme, df_raw = load_all_heatwave_data()
+except Exception as e:
+    st.error(f"데이터를 불러오는 중 오류가 발생했습니다: {e}")
     st.stop()
 
-# -----------------------------------------------------------------------------
-# 3. 관측지점 - 시군구 이름 매핑 딕셔너리
-# -----------------------------------------------------------------------------
-# 기상청 주요 관측지점 이름을 GeoJSON 속성('시군구') 매칭용 이름으로 변환
-station_to_sigungu = {
-    "서울": "종로구", "강릉": "강릉시", "대관령": "평창군", "추풍령": "영동군",
-    "춘천": "춘천시", "원주": "원주시", "속초": "속초시", "동해": "동해시",
-    "태백": "태백시", "대전": "유성구", "청주": "청주시", "충주": "충주시",
-    "천안": "천안시", "전주": "전주시", "군산": "군산시", "목포": "목포시",
-    "여수": "여수시", "광주": "북구", "대구": "중구", "포항": "포항시",
-    "안동": "안동시", "창원": "창원시", "울산": "남구", "부산": "중구",
-    "제주": "제주시", "서귀포": "서귀포시", "인천": "중구", "수원": "수원시"
+STATION_TO_SIGUNGU = {
+    "강릉": "강릉시", "강화": "강화군", "거제": "거제시", "거창": "거창군",
+    "고흥": "고흥군", "광주": "광주", "구미": "구미시", "군산": "군산시",
+    "금산": "금산군", "남원": "남원시", "남해": "남해군", "대관령": "평창군",
+    "대구": "대구", "대전": "대전", "목포": "목포시", "문경": "문경시",
+    "밀양": "밀양시", "보령": "보령시", "보은": "보은군", "봉화": "봉화군",
+    "부산": "부산", "부안": "부안군", "부여": "부여군", "산청": "산청군",
+    "서산": "서산시", "서울": "서울", "속초": "속초시", "수원": "수원시",
+    "안동": "안동시", "양평": "양평군", "여수": "여수시", "영덕": "영덕군",
+    "영주": "영주시", "영천": "영천시", "완도": "완도군", "울산": "울산",
+    "울진": "울진군", "원주": "원주시", "의성": "의성군", "이천": "이천시",
+    "인제": "인제군", "인천": "인천", "임실": "임실군", "장수": "장수군",
+    "장흥": "장흥군", "전주": "전주시", "정읍": "정읍시", "제천": "제천시",
+    "진주": "진주시", "창원": "창원시", "천안": "천안시", "철원": "철원군",
+    "청주": "청주시", "추풍령": "영동군", "춘천": "춘천시", "충주": "충주시",
+    "태백": "태백시", "통영": "통영시", "포항": "포항시", "합천": "합천군",
+    "해남": "해남군", "홍천": "홍천군",
 }
 
-# -----------------------------------------------------------------------------
-# 4. 사이드바 구성 (연도 선택)
-# -----------------------------------------------------------------------------
-# 년도 컬럼 정제 및 연도 목록 생성
-if "년도" in df_raw.columns:
-    df_raw["년도"] = pd.to_numeric(df_raw["년도"], errors="coerce")
-    year_list = sorted(df_raw["년도"].dropna().unique().astype(int))
-else:
-    # 컬럼명이 다른 경우 처리
-    year_col = [col for col for col in df_raw.columns if "년" in col or "year" in col.lower()][0]
-    df_raw["년도"] = pd.to_numeric(df_raw[year_col], errors="coerce")
-    year_list = sorted(df_raw["년도"].dropna().unique().astype(int))
+st.sidebar.header("\U0001f50d 조회 옵션")
+years = sorted(df_raw["년도"].unique())
+selected_year = st.sidebar.select_slider("\U0001f4c5 지도 조회 연도 선택", options=years, value=years[-1])
 
-st.sidebar.header("⚙️ 옵션 설정")
-selected_year = st.sidebar.slider(
-    "조회할 연도를 선택하세요",
-    min_value=int(min(year_list)),
-    max_value=int(max(year_list)),
-    value=int(max(year_list)),
-    step=1
-)
+df_year = df_raw[df_raw["년도"] == selected_year]
+df_counts = df_year.groupby("지점").size().reset_index(name="폭염일수")
+df_counts["시군구"] = df_counts["지점"].map(STATION_TO_SIGUNGU)
 
-# -----------------------------------------------------------------------------
-# 5. 선택된 연도 데이터 가공
-# -----------------------------------------------------------------------------
-df_year = df_raw[df_raw["년도"] == selected_year].copy()
+if not df_counts.empty:
+    max_row = df_counts.sort_values(by="폭염일수", ascending=False).iloc[0]
+    avg_val = df_counts["폭염일수"].mean()
+    m1, m2, m3 = st.columns(3)
+    m1.metric("전국 평균 폭염일수", f"{avg_val:.1f}일")
+    m2.metric("최다 폭염 관측지", f"{max_row['지점']} ({max_row['폭염일수']}일)")
+    m3.metric("관측 지점 수", f"{len(df_counts)}개 지역")
 
-# 지점별 폭염일수 집계
-station_col = "지점" if "지점" in df_year.columns else df_year.columns[2]
-df_counts = df_year.groupby(station_col).size().reset_index(name="폭염일수")
+geojson_display = copy.deepcopy(geojson_raw)
+heatwave_map = dict(zip(df_counts["시군구"], df_counts["폭염일수"]))
+for feature in geojson_display["features"]:
+    sigungu = feature["properties"].get("시군구", "")
+    val = heatwave_map.get(sigungu)
+    feature["properties"]["폭염일수"] = f"{val}일" if val is not None else "관측소 없음"
 
-# 관측지점을 시군구 이름으로 매핑
-df_counts["시군구"] = df_counts[station_col].map(station_to_sigungu).fillna(df_counts[station_col])
+st.subheader(f"\U0001f5fa\ufe0f {selected_year}년 전국 폭염일수 지도")
+m = folium.Map(location=[36.0, 127.8], zoom_start=7, tiles="CartoDB positron")
 
-# -----------------------------------------------------------------------------
-# 6. 상단 지표 카드 (Metrics)
-# -----------------------------------------------------------------------------
-avg_days = round(df_counts["폭염일수"].mean(), 1) if not df_counts.empty else 0
-max_row = df_counts.loc[df_counts["폭염일수"].idxmax()] if not df_counts.empty else None
-max_station = f"{max_row[station_col]} ({max_row['폭염일수']}일)" if max_row is not None else "-"
-total_stations = len(df_counts)
+min_val, max_val = float(df_counts["폭염일수"].min()), float(df_counts["폭염일수"].max())
+bins = [min_val - 1.0, min_val, min_val + 1.0] if min_val == max_val else \
+    [round(min_val + i * (max_val - min_val) / 5.0, 1) for i in range(6)]
 
-col1, col2, col3 = st.columns(3)
-col1.metric("📊 전국 평균 폭염일수", f"{avg_days} 일")
-col2.metric("🔥 최다 폭염 발생지", max_station)
-col3.metric("📍 총 관측지점 수", f"{total_stations} 곳")
-
-st.markdown("---")
-
-# -----------------------------------------------------------------------------
-# 7. 단계구분도(Choropleth) 지도 시각화
-# -----------------------------------------------------------------------------
-st.subheader(f"🗺️ {selected_year}년 전국 폭염일수 분포 지도")
-
-# Folium 기본 지도 생성 (대한민국 중심 좌표)
-m = folium.Map(location=[36.5, 127.5], zoom_start=7, tiles="cartodbpositron")
-
-# 단계구분도 레이어 추가
 folium.Choropleth(
-    geo_data=geojson_data,
-    name="choropleth",
-    data=df_counts,
-    columns=["시군구", "폭염일수"],
-    key_on="feature.properties.시군구",
-    fill_color="YlOrRd",
-    fill_opacity=0.7,
-    line_opacity=0.2,
-    legend_name=f"{selected_year}년 폭염일수(일)",
-    nan_fill_color="white"
+    geo_data=geojson_display, data=df_counts, columns=["시군구", "폭염일수"],
+    key_on="feature.properties.시군구", fill_color="YlOrRd", fill_opacity=0.78,
+    line_color="white", line_weight=1.0, legend_name=f"{selected_year}년 폭염일수 (일)",
+    bins=bins, nan_fill_color="#f8fafc",
 ).add_to(m)
 
-# 지도 출력
-st_folium(m, width=1200, height=500, returned_objects=[])
+folium.GeoJson(
+    geojson_display,
+    style_function=lambda x: {"fillColor": "#00000000", "color": "#00000000", "weight": 0},
+    tooltip=folium.GeoJsonTooltip(fields=["시도", "시군구", "폭염일수"], aliases=["시도:", "시군구:", "폭염일수:"]),
+).add_to(m)
 
-st.markdown("---")
+st_folium(m, width="100%", height=600, key=f"heatwave_map_{selected_year}", returned_objects=[])
 
-# -----------------------------------------------------------------------------
-# 8. 하단 데이터 표 구성
-# -----------------------------------------------------------------------------
-# 8-1. 상위/하위 10개 지점 표
-col_top, col_bottom = st.columns(2)
+st.divider()
+st.subheader(f"\U0001f4ca {selected_year}년 폭염일수 순위")
+col1, col2 = st.columns(2)
+top10 = df_counts.sort_values("폭염일수", ascending=False).head(10)[["지점", "시군구", "폭염일수"]].reset_index(drop=True)
+bottom10 = df_counts.sort_values("폭염일수", ascending=True).head(10)[["지점", "시군구", "폭염일수"]].reset_index(drop=True)
+with col1:
+    st.markdown("#### \U0001f525 폭염 많은 상위 10곳")
+    st.dataframe(top10, use_container_width=True)
+with col2:
+    st.markdown("#### \U0001f9ca 폭염 적은 하위 10곳")
+    st.dataframe(bottom10, use_container_width=True)
 
-with col_top:
-    st.subheader(f"🔝 {selected_year}년 폭염일수 상위 10곳")
-    top_10 = df_counts.sort_values(by="폭염일수", ascending=False).head(10)
-    st.dataframe(top_10[[station_col, "폭염일수"]].reset_index(drop=True), use_container_width=True)
-
-with col_bottom:
-    st.subheader(f"🧊 {selected_year}년 폭염일수 하위 10곳")
-    bottom_10 = df_counts.sort_values(by="폭염일수", ascending=True).head(10)
-    st.dataframe(bottom_10[[station_col, "폭염일수"]].reset_index(drop=True), use_container_width=True)
-
-st.markdown("---")
-
-# 8-2. 추가 통계 섹션 표 출력
-col_sec1, col_sec2 = st.columns(2)
-
-with col_sec1:
-    st.subheader("📜 가장 긴 폭염 기록")
-    if not df_longest.empty:
-        st.dataframe(df_longest, use_container_width=True)
-    else:
-        st.info("해당 섹션 데이터가 없습니다.")
-
-with col_sec2:
-    st.subheader("🗓️ 가장 빠른 / 가장 늦은 폭염 기록")
-    if not df_earliest_latest.empty:
-        st.dataframe(df_earliest_latest, use_container_width=True)
-    else:
-        st.info("해당 섹션 데이터가 없습니다.")
+st.divider()
+st.markdown("#### 가장 긴 폭염")
+st.dataframe(df_longest, use_container_width=True, hide_index=True)
+st.markdown("#### 가장 빠른/늦은 폭염")
+st.dataframe(df_extreme, use_container_width=True, hide_index=True)
